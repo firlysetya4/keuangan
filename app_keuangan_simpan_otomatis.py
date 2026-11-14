@@ -1,9 +1,11 @@
+
 import streamlit as st
 import pandas as pd
 import sqlite3
 from datetime import date
 from pathlib import Path
 import shutil
+import os
 
 # ==========================================
 # KONFIGURASI APLIKASI
@@ -15,19 +17,51 @@ st.set_page_config(
     layout="wide"
 )
 
-# Simpan database di folder yang sama dengan file script.
-# Dengan path tetap ini, database tidak berpindah hanya karena
-# Streamlit dijalankan dari folder kerja/terminal yang berbeda.
+# Lokasi database permanen
 FOLDER_APLIKASI = Path(__file__).resolve().parent
-DB_PATH = FOLDER_APLIKASI / "keuangan.db"
 
-# Jika database lama masih berada di folder kerja terminal (cwd)
-# dan belum ada di folder aplikasi, salin database lama terlebih dahulu.
-# File lama tidak dihapus.
+# Bisa menggunakan lokasi database khusus jika diperlukan
+DB_PATH = Path(
+    os.environ.get(
+        "FINANCE_DB_PATH",
+        str(FOLDER_APLIKASI / "keuangan.db")
+    )
+).expanduser().resolve()
+
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+# ==========================================
+# PEMULIHAN DATABASE LAMA
+# ==========================================
+
 DB_LAMA = Path.cwd() / "keuangan.db"
-if not DB_PATH.exists() and DB_LAMA.exists():
-    if DB_LAMA.resolve() != DB_PATH.resolve():
+
+def jumlah_data_database(path):
+    """Memeriksa jumlah transaksi dalam database."""
+    if not path.exists():
+        return 0
+
+    try:
+        conn = sqlite3.connect(str(path))
+        hasil = conn.execute(
+            "SELECT COUNT(*) FROM transaksi"
+        ).fetchone()[0]
+        conn.close()
+        return hasil
+    except Exception:
+        return 0
+
+
+# Jika database utama belum ada atau kosong,
+# periksa apakah ada database lama yang memiliki data.
+if DB_LAMA.exists() and DB_LAMA.resolve() != DB_PATH:
+
+    data_baru = jumlah_data_database(DB_PATH)
+    data_lama = jumlah_data_database(DB_LAMA)
+
+    if data_baru == 0 and data_lama > 0:
         shutil.copy2(DB_LAMA, DB_PATH)
+
 
 DB_NAME = str(DB_PATH)
 
@@ -37,46 +71,66 @@ DB_NAME = str(DB_PATH)
 # ==========================================
 
 def get_connection():
-    conn = sqlite3.connect(DB_NAME, timeout=30)
+
+    conn = sqlite3.connect(
+        DB_NAME,
+        timeout=30
+    )
+
     conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA journal_mode = WAL")
+
     return conn
 
 
 def create_database():
-    """Membuat tabel jika belum ada dan menambahkan kolom diskon
-    jika database lama belum memilikinya.
-    """
+
     conn = get_connection()
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS transaksi (
+
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+
             tanggal TEXT,
             jenis TEXT,
             keterangan TEXT,
             kategori TEXT,
+
             jumlah REAL,
             satuan TEXT,
             harga REAL,
+
             total REAL,
-            catatan TEXT
+            catatan TEXT,
+
+            diskon REAL DEFAULT 0
+
         )
     """)
 
-    # Migrasi database lama: tambahkan kolom diskon tanpa menghapus data.
+    # Memastikan database lama memiliki kolom diskon
     columns = [
         row[1]
-        for row in conn.execute("PRAGMA table_info(transaksi)").fetchall()
+        for row in conn.execute(
+            "PRAGMA table_info(transaksi)"
+        ).fetchall()
     ]
 
     if "diskon" not in columns:
-        conn.execute(
-            "ALTER TABLE transaksi ADD COLUMN diskon REAL DEFAULT 0"
-        )
+
+        conn.execute("""
+            ALTER TABLE transaksi
+            ADD COLUMN diskon REAL DEFAULT 0
+        """)
 
     conn.commit()
     conn.close()
 
+
+# ==========================================
+# MENAMBAHKAN TRANSAKSI
+# ==========================================
 
 def tambah_transaksi(
     tanggal,
@@ -90,14 +144,25 @@ def tambah_transaksi(
     catatan,
     diskon=0
 ):
+
     conn = get_connection()
 
     conn.execute("""
         INSERT INTO transaksi (
-            tanggal, jenis, keterangan, kategori,
-            jumlah, satuan, harga, diskon, total, catatan
+            tanggal,
+            jenis,
+            keterangan,
+            kategori,
+            jumlah,
+            satuan,
+            harga,
+            diskon,
+            total,
+            catatan
         )
+
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+
     """, (
         str(tanggal),
         jenis,
@@ -115,20 +180,43 @@ def tambah_transaksi(
     conn.close()
 
 
+# ==========================================
+# MENGAMBIL SEMUA DATA
+# ==========================================
+
 def ambil_data():
+
     conn = get_connection()
-    df = pd.read_sql_query(
-        """
-        SELECT id, tanggal, jenis, keterangan, kategori,
-               jumlah, satuan, harga, diskon, total, catatan
+
+    df = pd.read_sql_query("""
+
+        SELECT
+            id,
+            tanggal,
+            jenis,
+            keterangan,
+            kategori,
+            jumlah,
+            satuan,
+            harga,
+            diskon,
+            total,
+            catatan
+
         FROM transaksi
+
         ORDER BY tanggal DESC, id DESC
-        """,
-        conn
-    )
+
+    """, conn)
+
     conn.close()
+
     return df
 
+
+# ==========================================
+# MEMBUAT DATABASE JIKA BELUM ADA
+# ==========================================
 
 create_database()
 
