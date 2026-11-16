@@ -1,8 +1,10 @@
 
 import streamlit as st
 import pandas as pd
+import sqlite3
+import os
+from pathlib import Path
 from datetime import date
-from supabase import create_client
 
 # ==========================================
 # KONFIGURASI
@@ -16,35 +18,73 @@ st.set_page_config(
 
 st.title("💰 My Finance Dashboard")
 
-# ==========================================
-# KONEKSI DATABASE SUPABASE
-# ==========================================
-
-try:
-    SUPABASE_URL = st.secrets["SUPABASE_URL"]
-    SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
-
-    supabase = create_client(
-        SUPABASE_URL,
-        SUPABASE_KEY
+# Di hosting, arahkan ke folder disk permanen.
+# Jika tidak ada environment variable, gunakan folder script.
+DB_PATH = Path(
+    os.environ.get(
+        "FINANCE_DB_PATH",
+        str(Path(__file__).resolve().parent / "keuangan.db")
     )
+).expanduser().resolve()
 
-except Exception as e:
-    st.error(f"Konfigurasi Supabase belum benar: {e}")
-    st.stop()
-
-
-# ==========================================
-# FORMAT RUPIAH
-# ==========================================
-
-def rupiah(nilai):
-    nilai = float(nilai or 0)
-    return "Rp " + f"{nilai:,.0f}".replace(",", ".")
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
 # ==========================================
-# MENYIMPAN TRANSAKSI
+# KONEKSI SQLITE
+# ==========================================
+
+def get_connection():
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.execute("PRAGMA busy_timeout = 30000")
+    return conn
+
+
+# ==========================================
+# MEMBUAT DATABASE
+# ==========================================
+
+def create_database():
+    conn = get_connection()
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS transaksi (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tanggal TEXT,
+            jenis TEXT,
+            keterangan TEXT,
+            kategori TEXT,
+            jumlah REAL DEFAULT 0,
+            satuan TEXT,
+            harga REAL DEFAULT 0,
+            diskon REAL DEFAULT 0,
+            total REAL DEFAULT 0,
+            catatan TEXT
+        )
+    """)
+
+    columns = [
+        row[1]
+        for row in conn.execute(
+            "PRAGMA table_info(transaksi)"
+        ).fetchall()
+    ]
+
+    if "diskon" not in columns:
+        conn.execute("""
+            ALTER TABLE transaksi
+            ADD COLUMN diskon REAL DEFAULT 0
+        """)
+
+    conn.commit()
+    conn.close()
+
+
+create_database()
+
+
+# ==========================================
+# TAMBAH TRANSAKSI
 # ==========================================
 
 def tambah_transaksi(
@@ -55,144 +95,89 @@ def tambah_transaksi(
     jumlah,
     satuan,
     harga,
-    total,
-    catatan,
-    diskon=0
+    diskon,
+    catatan
 ):
+    subtotal = float(jumlah) * float(harga)
+    total = subtotal - float(diskon)
 
-    data = {
-        "tanggal": str(tanggal),
-        "jenis": jenis,
-        "keterangan": keterangan,
-        "kategori": kategori,
-        "jumlah": float(jumlah),
-        "satuan": satuan,
-        "harga": float(harga),
-        "diskon": float(diskon),
-        "total": float(total),
-        "catatan": catatan
-    }
+    if total < 0:
+        raise ValueError("Diskon tidak boleh melebihi subtotal.")
 
-    try:
-        supabase.table("transaksi").insert(
-            data
-        ).execute()
+    conn = get_connection()
 
-        return True
+    conn.execute("""
+        INSERT INTO transaksi (
+            tanggal, jenis, keterangan, kategori,
+            jumlah, satuan, harga, diskon, total, catatan
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        str(tanggal),
+        jenis,
+        keterangan,
+        kategori,
+        float(jumlah),
+        satuan,
+        float(harga),
+        float(diskon),
+        float(total),
+        catatan
+    ))
 
-    except Exception as e:
-        st.error(f"Gagal menyimpan transaksi: {e}")
-        return False
+    conn.commit()
+    conn.close()
 
 
 # ==========================================
-# MENGAMBIL SELURUH HISTORY
+# AMBIL DATA
 # ==========================================
 
 def ambil_data():
+    conn = get_connection()
 
-    semua_data = []
-    batas = 1000
-    mulai = 0
+    df = pd.read_sql_query("""
+        SELECT *
+        FROM transaksi
+        ORDER BY tanggal DESC, id DESC
+    """, conn)
 
-    while True:
-
-        hasil = (
-            supabase.table("transaksi")
-            .select("*")
-            .order("tanggal", desc=True)
-            .order("id", desc=True)
-            .range(mulai, mulai + batas - 1)
-            .execute()
-        )
-
-        data = hasil.data or []
-        semua_data.extend(data)
-
-        if len(data) < batas:
-            break
-
-        mulai += batas
-
-    kolom = [
-        "id", "tanggal", "jenis", "keterangan",
-        "kategori", "jumlah", "satuan", "harga",
-        "diskon", "total", "catatan"
-    ]
-
-    df = pd.DataFrame(semua_data)
-
-    if df.empty:
-        return pd.DataFrame(columns=kolom)
-
-    for kolom_angka in [
-        "jumlah", "harga", "diskon", "total"
-    ]:
-        df[kolom_angka] = pd.to_numeric(
-            df[kolom_angka], errors="coerce"
-        ).fillna(0)
-
+    conn.close()
     return df
 
 
 # ==========================================
-# MENGHAPUS TRANSAKSI
+# HAPUS TRANSAKSI
 # ==========================================
 
 def hapus_transaksi(id_transaksi):
+    conn = get_connection()
 
-    try:
+    conn.execute(
+        "DELETE FROM transaksi WHERE id = ?",
+        (int(id_transaksi),)
+    )
 
-        cek = (
-            supabase.table("transaksi")
-            .select("id")
-            .eq("id", int(id_transaksi))
-            .execute()
-        )
-
-        if not cek.data:
-            return False
-
-        (
-            supabase.table("transaksi")
-            .delete()
-            .eq("id", int(id_transaksi))
-            .execute()
-        )
-
-        return True
-
-    except Exception as e:
-        st.error(f"Gagal menghapus transaksi: {e}")
-        return False
+    conn.commit()
+    conn.close()
 
 
 # ==========================================
-# MEMBACA DATABASE
+# FORMAT RUPIAH
 # ==========================================
 
-try:
-    df = ambil_data()
-
-except Exception as e:
-    st.error(f"Tidak dapat membaca database: {e}")
-    st.stop()
+def rupiah(nilai):
+    return "Rp {:,.0f}".format(
+        float(nilai)
+    ).replace(",", ".")
 
 
 # ==========================================
-# SIDEBAR
+# MENU
 # ==========================================
-
-st.sidebar.title("💰 MY FINANCE")
-st.sidebar.caption("Pencatatan keuangan harian")
-
-st.sidebar.metric(
-    "Total History",
-    f"{len(df)} transaksi"
-)
 
 menu = st.sidebar.radio(
-    "Pilih Menu",
+    "Menu",
     [
         "Dashboard",
         "Pembelian",
@@ -202,25 +187,7 @@ menu = st.sidebar.radio(
     ]
 )
 
-
-# ==========================================
-# HITUNG SALDO
-# ==========================================
-
-total_pemasukan = df.loc[
-    df["jenis"] == "Pemasukan", "total"
-].sum()
-
-total_pembelian = df.loc[
-    df["jenis"] == "Pembelian", "total"
-].sum()
-
-total_pengeluaran = df.loc[
-    df["jenis"] == "Pengeluaran", "total"
-].sum()
-
-total_keluar = total_pembelian + total_pengeluaran
-saldo = total_pemasukan - total_keluar
+df = ambil_data()
 
 
 # ==========================================
@@ -229,364 +196,154 @@ saldo = total_pemasukan - total_keluar
 
 if menu == "Dashboard":
 
-    st.header("📊 Dashboard Keuangan")
+    st.subheader("Ringkasan Keuangan")
 
-    col1, col2, col3 = st.columns(3)
+    pemasukan = df.loc[
+        df["jenis"] == "Pemasukan", "total"
+    ].sum()
 
-    col1.metric(
-        "Total Pemasukan",
-        rupiah(total_pemasukan)
-    )
+    pembelian = df.loc[
+        df["jenis"] == "Pembelian", "total"
+    ].sum()
 
-    col2.metric(
-        "Total Pengeluaran",
-        rupiah(total_keluar)
-    )
+    pengeluaran = df.loc[
+        df["jenis"] == "Pengeluaran Belanja", "total"
+    ].sum()
 
-    col3.metric(
-        "Saldo Saat Ini",
-        rupiah(saldo)
-    )
+    saldo = pemasukan - pembelian - pengeluaran
 
-    st.divider()
+    c1, c2, c3, c4 = st.columns(4)
 
-    col1, col2 = st.columns(2)
-
-    with col1:
-
-        st.subheader("Rincian Pengeluaran")
-
-        rincian = pd.DataFrame({
-            "Jenis": [
-                "Pembelian",
-                "Pengeluaran Belanja"
-            ],
-            "Total": [
-                total_pembelian,
-                total_pengeluaran
-            ]
-        })
-
-        if rincian["Total"].sum() > 0:
-            st.bar_chart(
-                rincian.set_index("Jenis")
-            )
-        else:
-            st.info("Belum ada pengeluaran.")
-
-    with col2:
-
-        st.subheader("Komposisi Keuangan")
-
-        komposisi = pd.DataFrame({
-            "Jenis": [
-                "Pemasukan",
-                "Pengeluaran"
-            ],
-            "Total": [
-                total_pemasukan,
-                total_keluar
-            ]
-        })
-
-        if komposisi["Total"].sum() > 0:
-            st.bar_chart(
-                komposisi.set_index("Jenis")
-            )
-        else:
-            st.info("Belum ada transaksi.")
+    c1.metric("Pemasukan", rupiah(pemasukan))
+    c2.metric("Pembelian", rupiah(pembelian))
+    c3.metric("Pengeluaran", rupiah(pengeluaran))
+    c4.metric("Saldo", rupiah(saldo))
 
     st.divider()
-
-    st.subheader("Transaksi Terakhir")
+    st.subheader("Transaksi Terbaru")
 
     if not df.empty:
-
-        tampil = df[
-            ["tanggal", "jenis", "keterangan", "total"]
-        ].head(10).copy()
-
-        tampil.columns = [
-            "Tanggal", "Jenis", "Keterangan", "Total"
-        ]
-
-        tampil["Total"] = tampil["Total"].apply(rupiah)
-
         st.dataframe(
-            tampil,
+            df,
             use_container_width=True,
             hide_index=True
         )
-
     else:
         st.info("Belum ada transaksi.")
 
 
 # ==========================================
-# PEMBELIAN
+# FORM TRANSAKSI
 # ==========================================
 
-elif menu == "Pembelian":
+elif menu in [
+    "Pembelian",
+    "Pemasukan",
+    "Pengeluaran Belanja"
+]:
 
-    st.header("🛒 Input Pembelian")
+    st.subheader("Input " + menu)
 
-    with st.form("form_pembelian"):
+    with st.form("form_transaksi", clear_on_submit=True):
 
         tanggal = st.date_input(
-            "Tanggal Pembelian",
+            "Tanggal",
             value=date.today()
         )
 
-        nama_barang = st.text_input(
-            "Nama Barang",
-            placeholder="Contoh: Telur, Beras, Minyak"
+        keterangan = st.text_input("Keterangan")
+
+        if menu == "Pembelian":
+            kategori_list = [
+                "Bahan Baku", "Perlengkapan",
+                "Operasional", "Lainnya"
+            ]
+        elif menu == "Pemasukan":
+            kategori_list = [
+                "Penjualan", "Modal",
+                "Pendapatan Lainnya"
+            ]
+        else:
+            kategori_list = [
+                "Kebutuhan", "Transportasi",
+                "Makan", "Operasional", "Lainnya"
+            ]
+
+        kategori = st.selectbox(
+            "Kategori",
+            kategori_list
         )
 
         col1, col2 = st.columns(2)
 
         with col1:
-
-            kategori = st.selectbox(
-                "Kategori Barang",
-                [
-                    "Bahan Makanan",
-                    "Sembako",
-                    "Minuman",
-                    "Perlengkapan Rumah",
-                    "Lainnya"
-                ]
-            )
-
             jumlah = st.number_input(
                 "Jumlah",
                 min_value=0.0,
-                value=1.0,
                 step=1.0
             )
 
-            satuan = st.selectbox(
+            satuan = st.text_input(
                 "Satuan",
-                [
-                    "Kg", "Gram", "Liter",
-                    "Pcs", "Bungkus", "Dus", "Lainnya"
-                ]
+                value="Pcs"
             )
 
         with col2:
-
             harga = st.number_input(
-                "Harga per Satuan (Rp)",
-                min_value=0,
-                step=1000
+                "Harga Satuan (Rp)",
+                min_value=0.0,
+                step=1000.0
             )
 
-            diskon = st.number_input(
-                "Diskon (Rp)",
-                min_value=0,
-                value=0,
-                step=1000
-            )
+            diskon = 0.0
+
+            if menu == "Pembelian":
+                diskon = st.number_input(
+                    "Diskon (Rp)",
+                    min_value=0.0,
+                    step=1000.0
+                )
+
+        catatan = st.text_area("Catatan")
 
         subtotal = jumlah * harga
         total = subtotal - diskon
 
-        st.divider()
+        st.write("Subtotal:", rupiah(subtotal))
+        st.write("Diskon:", rupiah(diskon))
+        st.write("**Total:**", rupiah(total))
 
-        c1, c2, c3 = st.columns(3)
-
-        c1.metric("Subtotal", rupiah(subtotal))
-        c2.metric("Diskon", rupiah(diskon))
-        c3.metric("Total Bayar", rupiah(total))
-
-        catatan = st.text_area("Catatan (Opsional)")
-
-        submit = st.form_submit_button(
-            "Simpan Pembelian",
+        simpan = st.form_submit_button(
+            "Simpan Transaksi",
             use_container_width=True
         )
 
-        if submit:
-
-            if not nama_barang.strip():
-                st.error("Nama barang harus diisi.")
-
+        if simpan:
+            if not keterangan.strip():
+                st.error("Keterangan wajib diisi.")
             elif jumlah <= 0:
                 st.error("Jumlah harus lebih dari 0.")
-
-            elif harga <= 0:
-                st.error("Harga harus lebih dari 0.")
-
             elif diskon > subtotal:
-                st.error("Diskon melebihi subtotal.")
-
+                st.error("Diskon tidak boleh melebihi subtotal.")
             else:
-
-                berhasil = tambah_transaksi(
-                    tanggal=tanggal,
-                    jenis="Pembelian",
-                    keterangan=nama_barang.strip(),
-                    kategori=kategori,
-                    jumlah=jumlah,
-                    satuan=satuan,
-                    harga=harga,
-                    total=total,
-                    catatan=catatan,
-                    diskon=diskon
-                )
-
-                if berhasil:
-                    st.success(
-                        "Pembelian berhasil disimpan!"
+                try:
+                    tambah_transaksi(
+                        tanggal,
+                        menu,
+                        keterangan,
+                        kategori,
+                        jumlah,
+                        satuan,
+                        harga,
+                        diskon,
+                        catatan
                     )
+
+                    st.success("Transaksi berhasil disimpan.")
                     st.rerun()
 
-
-# ==========================================
-# PEMASUKAN
-# ==========================================
-
-elif menu == "Pemasukan":
-
-    st.header("💵 Input Pemasukan")
-
-    with st.form("form_pemasukan"):
-
-        tanggal = st.date_input(
-            "Tanggal Pemasukan",
-            value=date.today()
-        )
-
-        sumber = st.text_input(
-            "Sumber Pemasukan",
-            placeholder="Contoh: Gaji, Penjualan, Bonus"
-        )
-
-        kategori = st.selectbox(
-            "Kategori",
-            [
-                "Gaji", "Penjualan", "Bonus",
-                "Transfer", "Hadiah", "Lainnya"
-            ]
-        )
-
-        jumlah = st.number_input(
-            "Nominal Pemasukan (Rp)",
-            min_value=0,
-            step=10000
-        )
-
-        catatan = st.text_area("Catatan (Opsional)")
-
-        submit = st.form_submit_button(
-            "Simpan Pemasukan",
-            use_container_width=True
-        )
-
-        if submit:
-
-            if not sumber.strip():
-                st.error("Sumber pemasukan harus diisi.")
-
-            elif jumlah <= 0:
-                st.error("Nominal harus lebih dari 0.")
-
-            else:
-
-                berhasil = tambah_transaksi(
-                    tanggal=tanggal,
-                    jenis="Pemasukan",
-                    keterangan=sumber.strip(),
-                    kategori=kategori,
-                    jumlah=1,
-                    satuan="Transaksi",
-                    harga=jumlah,
-                    total=jumlah,
-                    catatan=catatan,
-                    diskon=0
-                )
-
-                if berhasil:
-                    st.success(
-                        "Pemasukan berhasil disimpan!"
-                    )
-                    st.rerun()
-
-
-# ==========================================
-# PENGELUARAN BELANJA
-# ==========================================
-
-elif menu == "Pengeluaran Belanja":
-
-    st.header("💸 Input Pengeluaran Belanja")
-
-    with st.form("form_pengeluaran"):
-
-        tanggal = st.date_input(
-            "Tanggal Pengeluaran",
-            value=date.today()
-        )
-
-        keterangan = st.text_input(
-            "Keterangan Pengeluaran",
-            placeholder="Contoh: Bayar listrik, Air, Transportasi"
-        )
-
-        kategori = st.selectbox(
-            "Kategori Pengeluaran",
-            [
-                "Listrik",
-                "Air",
-                "Transportasi",
-                "Tagihan",
-                "Kesehatan",
-                "Pendidikan",
-                "Rumah Tangga",
-                "Lainnya"
-            ]
-        )
-
-        jumlah = st.number_input(
-            "Nominal Pengeluaran (Rp)",
-            min_value=0,
-            step=10000
-        )
-
-        catatan = st.text_area("Catatan (Opsional)")
-
-        submit = st.form_submit_button(
-            "Simpan Pengeluaran",
-            use_container_width=True
-        )
-
-        if submit:
-
-            if not keterangan.strip():
-                st.error("Keterangan harus diisi.")
-
-            elif jumlah <= 0:
-                st.error("Nominal harus lebih dari 0.")
-
-            else:
-
-                berhasil = tambah_transaksi(
-                    tanggal=tanggal,
-                    jenis="Pengeluaran",
-                    keterangan=keterangan.strip(),
-                    kategori=kategori,
-                    jumlah=1,
-                    satuan="Transaksi",
-                    harga=jumlah,
-                    total=jumlah,
-                    catatan=catatan,
-                    diskon=0
-                )
-
-                if berhasil:
-                    st.success(
-                        "Pengeluaran berhasil disimpan!"
-                    )
-                    st.rerun()
+                except Exception as e:
+                    st.error(f"Gagal menyimpan: {e}")
 
 
 # ==========================================
@@ -595,101 +352,54 @@ elif menu == "Pengeluaran Belanja":
 
 elif menu == "Riwayat Transaksi":
 
-    st.header("📋 Riwayat Transaksi")
+    st.subheader("Riwayat Transaksi")
 
-    st.caption(
-        "Seluruh transaksi dari hari pertama sampai hari ini."
-    )
+    if df.empty:
+        st.info("Belum ada riwayat transaksi.")
 
-    jenis_filter = st.selectbox(
-        "Filter Jenis Transaksi",
-        [
-            "Semua",
-            "Pembelian",
-            "Pemasukan",
-            "Pengeluaran"
-        ]
-    )
-
-    data = df.copy()
-
-    if jenis_filter != "Semua":
-        data = data[
-            data["jenis"] == jenis_filter
-        ]
-
-    if not data.empty:
-
-        data_tampil = data[
+    else:
+        jenis = st.selectbox(
+            "Filter Transaksi",
             [
-                "id",
-                "tanggal",
-                "jenis",
-                "keterangan",
-                "kategori",
-                "jumlah",
-                "satuan",
-                "harga",
-                "diskon",
-                "total",
-                "catatan"
+                "Semua",
+                "Pembelian",
+                "Pemasukan",
+                "Pengeluaran Belanja"
             ]
-        ].copy()
+        )
 
-        data_tampil.columns = [
-            "ID",
-            "Tanggal",
-            "Jenis",
-            "Keterangan",
-            "Kategori",
-            "Jumlah",
-            "Satuan",
-            "Harga Satuan",
-            "Diskon",
-            "Total Bayar",
-            "Catatan"
-        ]
+        tampil = df.copy()
 
-        for kolom in [
-            "Harga Satuan",
-            "Diskon",
-            "Total Bayar"
-        ]:
-
-            data_tampil[kolom] = (
-                data_tampil[kolom].apply(rupiah)
-            )
+        if jenis != "Semua":
+            tampil = tampil[
+                tampil["jenis"] == jenis
+            ]
 
         st.dataframe(
-            data_tampil,
+            tampil,
             use_container_width=True,
             hide_index=True
         )
 
-        st.caption(
-            f"Jumlah transaksi: {len(data)}"
+        csv = tampil.to_csv(index=False).encode("utf-8-sig")
+
+        st.download_button(
+            "Download Riwayat CSV",
+            data=csv,
+            file_name="riwayat_keuangan.csv",
+            mime="text/csv"
         )
 
-    else:
+        st.divider()
 
-        st.info("Belum ada transaksi untuk filter ini.")
+        st.subheader("Hapus Transaksi")
 
-    st.divider()
+        id_hapus = st.selectbox(
+            "Pilih ID",
+            tampil["id"].tolist()
+        )
 
-    st.subheader("🗑️ Hapus Transaksi")
-
-    id_hapus = st.number_input(
-        "Masukkan ID transaksi",
-        min_value=1,
-        step=1
-    )
-
-    if st.button("Hapus Transaksi"):
-
-        berhasil = hapus_transaksi(id_hapus)
-
-        if berhasil:
+        if st.button("Hapus Transaksi"):
+            hapus_transaksi(id_hapus)
             st.success("Transaksi berhasil dihapus.")
             st.rerun()
-        else:
-            st.warning("ID transaksi tidak ditemukan.")
